@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+
+# Copyright 2020 Karl Stenerud
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+set -eu
+
+debconf_get()
+{
+    key=$1
+    pattern="$key\nValue: \K\w+"
+    grep -Pzo "$pattern" /var/cache/debconf/config.dat | tr -d '\0'
+}
+
+get_host_locale_kb_tz()
+{
+    language=${LANGUAGE%%_*}
+    region=$(echo ${LANGUAGE##*_}|cut -f1 -d":")
+    kb_layout=$(debconf_get keyboard-configuration/layoutcode)
+    kb_model=$(debconf_get keyboard-configuration/modelcode)
+    timezone=$(cat /etc/timezone)
+
+    echo "$language:$region:$kb_layout:$kb_model:$timezone"
+}
+
+# -------------------------------------------------------------------
+
+CONTAINER_NAME=
+EPHEMERAL=
+VM=
+IMAGE="ubuntu:"
+MOUNT_HOSTSIDE="$PWD"
+MOUNT_GUESTSIDE="/home/host"
+UID_GID_MAP="ubuntu:ubuntu:$USER:$(id -g $USER)"
+LOCALE_KB_TZ="$(get_host_locale_kb_tz)"
+
+# -------------------------------------------------------------------
+
+error_usage()
+{
+    echo "Start an LXC container wrapping a directory in the host"
+    echo
+    echo "Usage: $0 <flags>"
+    echo
+    echo "Where:"
+    echo "    -n <name>: container name (default LXD's choice)"
+    echo "    -i <lxd image>: LXD image to use (default $IMAGE)"
+    echo "    -m <host_path:guest_path>: mount host to guest (default $MOUNT_HOSTSIDE:$MOUNT_GUESTSIDE)"
+    echo "    -u <guest_user:guest_group:host_user:host_group>: UID map (default $UID_GID_MAP)"
+    echo "    -l <language:region:kb_layout:kb_model:tz>: Locale (default $LOCALE_KB_TZ)"
+    echo "    -e: Spawn an ephemeral container (gets destroyed when you exit the shell)"
+    # echo "    -v: Spawn a VM instead of a container"
+    exit 1
+}
+
+# -------------------------------------------------------------------
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -n|--name)
+            CONTAINER_NAME="$2"
+            shift
+            shift
+            ;;
+        -o|--os)
+            IMAGE="$2"
+            shift
+            shift
+            ;;
+        -m|--mount)
+            regexp="([^:]+):(.+)"
+            if [[ "$2" =~ $regexp ]]; then
+                MOUNT_HOSTSIDE="${BASH_REMATCH[1]}"
+                MOUNT_GUESTSIDE="${BASH_REMATCH[2]}"
+            else
+                echo "Error: Mount arg must be in the form host_path:guest_path"
+                error_usage
+            fi
+
+            shift
+            shift
+            ;;
+        -u|--uidmap)
+            UID_GID_MAP="$2"
+            shift
+            shift
+            ;;
+        -l|--locale)
+            LOCALE_KB_TZ="$2"
+            shift
+            shift
+            ;;
+        -e|--ephemeral)
+            EPHEMERAL=true
+            shift
+            ;;
+        # -v|--vm)
+        #     VM="--vm"
+        #     shift
+        #     ;;
+        -*)
+            error_usage
+            shift
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- "${POSITIONAL[@]}" # restore positional args
+
+    # -------------------------------------------------------------------
+
+is_numeric()
+{
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+get_colon_separated_arguments()
+{
+    subargcount="$1"
+    argument="$2"
+
+    pattern="\\(.*\\)"
+    replace="\1"
+    if [ $subargcount -gt 1 ]; then
+        for i in $(seq 2 $subargcount); do
+            pattern="\\([^:]*\\):$pattern"
+            replace="$replace \\$i"
+        done
+    fi
+
+    sed_cmd="s/$pattern/$replace/g"
+    params="$(echo "$argument"|sed "$sed_cmd")"
+    if [ "$params" != "$argument" ]; then
+        echo "$params"
+    else
+        echo
+    fi
+}
+
+lxc_warn_if_uid_gid_map_not_enabled()
+{
+    id="$1"
+    file="$2"
+
+    user=root
+    while read line; do
+        if [ -z "$line" ]; then continue; fi
+        fields=($(get_colon_separated_arguments 3 $line))
+        if [ "${fields[0]}" != "$user" ]; then continue; fi
+        if [ "${fields[1]}" == "$id" ]; then return; fi
+    done < "$file"
+    echo "WARNING: You'll need to add permission for $user to share id $id in $file:"
+    echo "    $user:$id:1"
+    echo "The container may fail to build without it."
+}
+
+lxc_get_host_uid()
+{
+    if is_numeric "$1"; then
+        echo $1
+    else
+        id -u "$1"
+    fi
+}
+
+lxc_get_host_gid()
+{
+    if is_numeric "$1"; then
+        echo $1
+    else
+        id -g "$1"
+    fi
+}
+
+lxc_get_guest_uid()
+{
+    if is_numeric "$1"; then
+        echo $1
+    else
+        lxc_exec id -u "$1"
+    fi
+}
+
+lxc_get_guest_gid()
+{
+    if is_numeric "$1"; then
+        echo $1
+    else
+        lxc_exec id -g "$1"
+    fi
+}
+
+lxc_check_map_user()
+{
+    lxc_warn_if_uid_gid_map_not_enabled $(lxc_get_host_uid $1) /etc/subuid
+}
+
+lxc_check_map_group()
+{
+    lxc_warn_if_uid_gid_map_not_enabled $(lxc_get_host_gid $1) /etc/subgid
+}
+
+lxc_generate_uid_map()
+{
+    guest_uid="$(lxc_get_guest_uid $1)"
+    host_uid="$(lxc_get_host_uid $2)"
+
+    idmap="$(lxc config get $CONTAINER_NAME raw.idmap)"
+        if [ ! -z "$idmap" ]; then
+            echo "$idmap"
+        fi
+    echo "uid $host_uid $guest_uid"
+}
+
+lxc_generate_gid_map()
+{
+    guest_gid="$(lxc_get_guest_gid $1)"
+    host_gid="$(lxc_get_host_gid $2)"
+
+    echo "gid $host_gid $guest_gid"
+}
+
+lxc_generate_uid_gid_map()
+{
+    guest_user="$1"
+    host_user="$2"
+    guest_group="$3"
+    host_group="$4"
+
+    lxc_generate_uid_map $guest_user $host_user
+    lxc_generate_gid_map $guest_group $host_group
+}
+
+lxc_add_uid_gid_map()
+{
+    # Format guest-user:guest-group:host-user:host-group
+    fields=($(get_colon_separated_arguments 4 $1))
+    guest_user="${fields[0]}"
+    guest_group="${fields[1]}"
+    host_user="${fields[2]}"
+    host_group="${fields[3]}"
+
+    lxc_check_map_user $host_user
+    lxc_check_map_group $host_group
+
+    echo "Mapping guest user:group $guest_user:$guest_group to host user:group $host_user:$host_group"
+    lxc config set $CONTAINER_NAME raw.idmap "$(lxc_generate_uid_gid_map $guest_user $host_user $guest_group $host_group)"
+}
+
+lxc_uid_has_permission() {
+    uid="$1"
+    file="$2"
+    mode="$3" # r, w, or x
+
+    if ! sudo -u "#$uid" /bin/sh -c "[ -${mode} '$file' ]" ; then
+        return 1
+    fi
+}
+
+lxc_mount_host()
+{
+    device_name="$1"
+    host_path="$2"
+    guest_path="$3"
+
+    lxc exec $CONTAINER_NAME -- mkdir -p "$guest_path"
+    lxc config device add $CONTAINER_NAME $device_name disk source="$host_path" path="$guest_path"
+}
+
+lxc_is_network_up()
+{
+    lxc_exec grep $'\t0003\t' /proc/net/route >/dev/null
+}
+
+lxc_wait_for_network()
+{
+    sleep 1
+    until lxc_is_network_up;
+    do
+        echo "Waiting for network"
+        sleep 1
+    done
+    sleep 2
+}
+
+lxc_set_locale_kb_tz()
+{
+    fields=($(get_colon_separated_arguments 5 $1))
+    language="${fields[0]}"
+    region="${fields[1]}"
+    kb_layout="${fields[2]}"
+    kb_model="${fields[3]}"
+    timezone="${fields[4]}"
+
+    lxc_install_packages locales tzdata debconf software-properties-common
+
+    lang_base="${language}_${region}"
+    lang_full="${lang_base}.UTF-8"
+
+    lxc_exec locale-gen ${lang_base} ${lang_full}
+    lxc_exec update-locale LANG=${lang_full} LANGUAGE=${lang_base}:${language} LC_ALL=${lang_full}
+    echo "keyboard-configuration keyboard-configuration/layoutcode string ${kb_layout}" | lxc_exec debconf-set-selections
+    echo "keyboard-configuration keyboard-configuration/modelcode string ${kb_model}" | lxc_exec debconf-set-selections
+
+    lxc_exec timedatectl set-timezone "$timezone"
+}
+
+lxc_install_packages()
+{
+    packages="$@"
+    echo "Installing packages $packages"
+    lxc_exec bash -c "export DEBIAN_FRONTEND=noninteractive; apt install -y $packages"
+}
+
+lxc_exec()
+{
+    lxc exec $CONTAINER_NAME -- $@
+}
+
+# -------------------------------------------------------------------
+
+echo "Initializing new container with image \"$IMAGE\". This may take awhile if the image hasn't been downloaded..."
+LXC_INIT_ARGS="$IMAGE $CONTAINER_NAME $VM $EPHEMERAL"
+if [ "$CONTAINER_NAME" == "" ]; then
+    CONTAINER_NAME=$(lxc init $LXC_INIT_ARGS | tail -1 | sed 's/.* name is: //g')
+else
+    lxc init $LXC_INIT_ARGS
+fi
+
+echo "Container $CONTAINER_NAME initialized"
+
+if [ "$VM" == "" ]; then
+    lxc config set $CONTAINER_NAME security.privileged true
+    lxc config set $CONTAINER_NAME security.nesting true
+
+    # KVM needs access to /dev/kvm and /dev/vhost-net
+    lxc config device add $CONTAINER_NAME kvm unix-char path=/dev/kvm
+    lxc config device add $CONTAINER_NAME vhost-net unix-char path=/dev/vhost-net
+    lxc config device set $CONTAINER_NAME vhost-net mode 0600
+
+fi
+
+lxc start $CONTAINER_NAME
+lxc_wait_for_network
+sleep 1
+
+lxc_set_locale_kb_tz "$LOCALE_KB_TZ"
+lxc_add_uid_gid_map "$UID_GID_MAP"
+
+if [ "$VM" == "" ]; then
+    # allow snap
+    lxc_mount_host lib-modules "/lib/modules" "/lib/modules" r
+fi
+
+lxc_mount_host host "$MOUNT_HOSTSIDE" "$MOUNT_GUESTSIDE"
+
+echo "Container $CONTAINER_NAME started. Hostside [$MOUNT_HOSTSIDE] is mapped to guestside [$MOUNT_GUESTSIDE]"
+echo "Launching bash inside $CONTAINER_NAME..."
+lxc exec $CONTAINER_NAME -- sh -c "cd \"$MOUNT_GUESTSIDE\"; su ubuntu -c /bin/bash"
+if [ "$EPHEMERAL" != "" ]; then
+    lxc delete -f $CONTAINER_NAME
+fi
