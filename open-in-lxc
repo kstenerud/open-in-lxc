@@ -31,8 +31,9 @@ debconf_get()
 
 get_host_locale_kb_tz()
 {
-    language=${LANGUAGE%%_*}
-    region=$(echo ${LANGUAGE##*_}|cut -f1 -d":")
+    langfield="$(grep "LANG=" /etc/default/locale |sed 's/[^a-z]*\([a-z]*.*\)/\1/g' | sed 's/\([^A-Z]*[A-Z]*\).*/\1/g')"
+    language=${langfield%%_*}
+    region=${langfield##*_}
     kb_layout=$(debconf_get keyboard-configuration/layoutcode)
     kb_model=$(debconf_get keyboard-configuration/modelcode)
     timezone=$(cat /etc/timezone)
@@ -50,6 +51,8 @@ MOUNT_HOSTSIDE="$PWD"
 MOUNT_GUESTSIDE="/home/host"
 UID_GID_MAP="ubuntu:ubuntu:$USER:$(id -g $USER)"
 LOCALE_KB_TZ="$(get_host_locale_kb_tz)"
+INIT_SCRIPT=
+DELETE_EXISTING=
 
 # -------------------------------------------------------------------
 
@@ -65,7 +68,9 @@ error_usage()
     echo "    -m <host_path:guest_path>: mount host to guest (default $MOUNT_HOSTSIDE:$MOUNT_GUESTSIDE)"
     echo "    -u <guest_user:guest_group:host_user:host_group>: UID map (default $UID_GID_MAP)"
     echo "    -l <language:region:kb_layout:kb_model:tz>: Locale (default $LOCALE_KB_TZ)"
+    echo "    -s <script>: Script to run upon starting the container for the first time (lxc will restart afterwards)"
     echo "    -e: Spawn an ephemeral container (gets destroyed when you exit the shell)"
+    echo "    -d: Delete container if it already exists"
     # echo "    -v: Spawn a VM instead of a container"
     exit 1
 }
@@ -108,8 +113,17 @@ while [[ $# -gt 0 ]]; do
             shift
             shift
             ;;
+        -s|--script)
+            INIT_SCRIPT="$2"
+            shift
+            shift
+            ;;
         -e|--ephemeral)
             EPHEMERAL=true
+            shift
+            ;;
+        -d|--delete)
+            DELETE_EXISTING=true
             shift
             ;;
         # -v|--vm)
@@ -343,8 +357,12 @@ lxc_exec()
 
 # -------------------------------------------------------------------
 
+if [ "$DELETE_EXISTING" != "" ] && [ "$CONTAINER_NAME" != "" ]; then
+    lxc delete -f $CONTAINER_NAME >/dev/null 2&>1 || true
+fi
+
 echo "Initializing new container with image \"$IMAGE\". This may take awhile if the image hasn't been downloaded..."
-LXC_INIT_ARGS="$IMAGE $CONTAINER_NAME $VM $EPHEMERAL"
+LXC_INIT_ARGS="$IMAGE $CONTAINER_NAME $VM"
 if [ "$CONTAINER_NAME" == "" ]; then
     CONTAINER_NAME=$(lxc init $LXC_INIT_ARGS | tail -1 | sed 's/.* name is: //g')
 else
@@ -377,6 +395,14 @@ if [ "$VM" == "" ]; then
 fi
 
 lxc_mount_host host "$MOUNT_HOSTSIDE" "$MOUNT_GUESTSIDE"
+
+if [ "$INIT_SCRIPT" != "" ]; then
+    lxc file push "$INIT_SCRIPT" $CONTAINER_NAME/var/initscript.sh
+    lxc exec $CONTAINER_NAME -- chmod a+x /var/initscript.sh
+    echo "Running installer script at /var/initscript.sh"
+    lxc exec $CONTAINER_NAME /var/initscript.sh
+    lxc restart $CONTAINER_NAME
+fi
 
 echo "Container $CONTAINER_NAME started. Hostside [$MOUNT_HOSTSIDE] is mapped to guestside [$MOUNT_GUESTSIDE]"
 echo "Launching bash inside $CONTAINER_NAME..."

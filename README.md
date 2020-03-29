@@ -11,7 +11,9 @@ Where:
   * `-m <host_path:guest_path>`: mount host to guest (default $PWD:/home/host)
   * `-u <guest_user:guest_group:host_user:host_group>`: UID map (default ubuntu:ubuntu:current-uid:current-gid)
   * `-l <language:region:kb_layout:kb_model:tz>`: Locale (default host's configuration)
+  * `-s <script>`: Script to run upon starting the container for the first time
   * `-e`: Spawn an ephemeral container (gets destroyed when you exit the shell)
+  * `-d`: Delete container if it already exists
 
 Calling `open-in-lxc` with no arguments will create a new Ubuntu LTS container
 with the current directory mounted under `/home/host`, and log you into a shell
